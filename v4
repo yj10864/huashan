@@ -1,0 +1,178 @@
+def should_sell(self, units):
+    """根据当前市场状况决定是否应该卖出以及卖出多少单位
+    
+    返回:
+        tuple: (决策, 单位数) - 决策为 'sell' 或 'hold'，单位数为 0-100
+    """
+    # 如果剩余单位为0，直接返回hold
+    if self.units_left <= 0:
+        return 'hold', 0
+    
+    # 计算剩余时间（秒）
+    if self.trading_end_time:
+        remaining_time = (self.trading_end_time - datetime.now()).total_seconds()
+    else:
+        remaining_time = 600  # 默认10分钟
+    
+    # 如果剩余时间小于20秒且还有剩余单位，全部卖出
+    if remaining_time < 20 and self.units_left > 0:
+        return 'sell', self.units_left
+    
+    if len(self.price_history) < 10:
+        return 'hold', 0
+    
+    # 提取最近的价格数据
+    recent_prices = [price for _, price, status in self.price_history[-10:] if status == "T"]
+    if not recent_prices:
+        return 'hold', 0
+    
+    # 计算简单的技术指标
+    current = self.current_price
+    ma5 = sum(recent_prices[-5:]) / min(5, len(recent_prices[-5:]))
+    
+    # 计算价格变化率
+    if len(recent_prices) >= 2:
+        price_change = (recent_prices[-1] - recent_prices[-2]) / recent_prices[-2]
+    else:
+        price_change = 0
+    
+    # 计算波动率 (简化版)
+    if len(recent_prices) >= 5:
+        volatility = pd.Series(recent_prices[-5:]).std() / pd.Series(recent_prices[-5:]).mean()
+    else:
+        volatility = 0
+    
+    # 决策逻辑
+    # 1. 价格高于移动平均线
+    condition1 = current > ma5 if self.best_selling_conditions['price_above_ma'] else True
+    
+    # 2. 波动率低于阈值
+    condition2 = volatility < self.best_selling_conditions['low_volatility']
+    
+    # 3. 价格有正向动量
+    condition3 = price_change > self.best_selling_conditions['positive_momentum']
+    
+    # 4. 时间因素：随着交易窗口接近结束，降低卖出标准
+    time_pressure = max(0, 1 - (remaining_time / 600))  # 0到1之间的值，表示时间压力
+    
+    # 根据剩余时间调整卖出单位数
+    if time_pressure > 0.8 and self.units_left > 20:
+        # 时间快结束了，需要加速卖出
+        logger.info(f"时间压力大 ({time_pressure:.2f})，考虑加速卖出")
+        return 'sell', min(20, self.units_left)
+    
+    # 综合决策
+    should_sell_decision = condition1 and condition2 and condition3
+    
+    logger.info(f"交易决策分析: 价格={current}, MA5={ma5:.2f}, 波动率={volatility:.4f}, "
+               f"价格变化率={price_change:.4f}, 时间压力={time_pressure:.2f}, 决策={should_sell_decision}")
+    
+    if should_sell_decision:
+        # 决定卖出单位数
+        if time_pressure < 0.3:
+            # 交易初期，谨慎卖出
+            units_to_sell = min(5, self.units_left)
+        elif time_pressure < 0.7:
+            # 交易中期，适度卖出
+            units_to_sell = min(10, self.units_left)
+        else:
+            # 交易后期，积极卖出
+            units_to_sell = min(20, self.units_left)
+        
+        return 'sell', units_to_sell
+    else:
+        return 'hold', 0
+
+
+
+def analyze_historical_patterns(self, trading_data):
+    """分析历史数据模式，寻找最佳交易时机"""
+    logger.info("分析历史交易模式...")
+    
+    # 计算价格变化率
+    trading_data['price_change'] = trading_data['current'].pct_change()
+    
+    # 计算移动平均线
+    trading_data['ma5'] = trading_data['current'].rolling(window=5).mean()
+    trading_data['ma10'] = trading_data['current'].rolling(window=10).mean()
+    trading_data['ma20'] = trading_data['current'].rolling(window=20).mean()
+    
+    # 计算波动率
+    trading_data['volatility'] = trading_data['current'].rolling(window=10).std()
+    
+    # 计算相对强弱指标(RSI)
+    delta = trading_data['current'].diff()
+    gain = (delta.where(delta > 0, 0)).fillna(0)
+    loss = (-delta.where(delta < 0, 0)).fillna(0)
+    avg_gain = gain.rolling(window=14).mean()
+    avg_loss = loss.rolling(window=14).mean()
+    rs = avg_gain / avg_loss
+    trading_data['rsi'] = 100 - (100 / (1 + rs))
+    
+    # 计算MACD
+    trading_data['ema12'] = trading_data['current'].ewm(span=12).mean()
+    trading_data['ema26'] = trading_data['current'].ewm(span=26).mean()
+    trading_data['macd'] = trading_data['ema12'] - trading_data['ema26']
+    trading_data['signal'] = trading_data['macd'].ewm(span=9).mean()
+    
+    # 分析最佳卖出条件
+    # 1. 找出历史数据中价格上涨的区间
+    trading_data['price_up'] = trading_data['current'].pct_change() > 0
+    
+    # 2. 分析这些上涨区间的特征
+    up_periods = trading_data[trading_data['price_up']]
+    
+    # 3. 提取成功卖出时机的特征
+    if not up_periods.empty:
+        # 计算上涨区间的平均RSI
+        avg_rsi_in_up_periods = up_periods['rsi'].mean()
+        
+        # 计算上涨区间的平均波动率
+        avg_volatility_in_up_periods = up_periods['volatility'].mean()
+        
+        # 计算上涨区间的平均价格与MA5的关系
+        avg_price_to_ma5_ratio = (up_periods['current'] / up_periods['ma5']).mean()
+        
+        # 设置最佳卖出条件
+        self.best_selling_conditions = {
+            'price_above_ma': True,  # 价格高于移动平均
+            'price_to_ma5_ratio': avg_price_to_ma5_ratio,  # 价格与MA5的最佳比例
+            'optimal_rsi': avg_rsi_in_up_periods,  # 最佳RSI值
+            'low_volatility': avg_volatility_in_up_periods,  # 波动率阈值
+            'positive_momentum': 0.001,  # 正向动量阈值
+            'rsi_threshold': 70,  # RSI超买区域
+            'macd_signal_cross': True  # MACD信号线交叉
+        }
+        
+        logger.info(f"从历史数据中提取的最佳卖出条件: {self.best_selling_conditions}")
+    else:
+        # 如果没有足够的上涨区间数据，使用默认值
+        self.best_selling_conditions = {
+            'price_above_ma': True,
+            'price_to_ma5_ratio': 1.01,
+            'optimal_rsi': 65,
+            'low_volatility': 0.002,
+            'positive_momentum': 0.001,
+            'rsi_threshold': 70,
+            'macd_signal_cross': True
+        }
+    
+    # 保存历史数据的统计特征，用于后续决策
+    self.historical_stats = {
+        'avg_price': trading_data['current'].mean(),
+        'std_price': trading_data['current'].std(),
+        'max_price': trading_data['current'].max(),
+        'min_price': trading_data['current'].min(),
+        'avg_volatility': trading_data['volatility'].mean(),
+        'price_range': trading_data['current'].max() - trading_data['current'].min()
+    }
+    
+    logger.info("历史模式分析完成，已设置交易条件")
+    logger.info(f"历史数据统计特征: {self.historical_stats}")
+
+      
+  self.best_selling_conditions = {
+    'price_above_ma': True,  # 价格高于移动平均
+    'low_volatility': 0.002,  # 波动率阈值
+    'positive_momentum': 0.001  # 正向动量阈值
+}
