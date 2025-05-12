@@ -1,0 +1,426 @@
+import pandas as pd
+import websocket
+import json
+import time
+import requests
+from datetime import datetime, timedelta
+import threading
+import logging
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.animation import FuncAnimation
+import numpy as np
+
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+class IndexTrader:
+    def __init__(self):
+        self.units_left = 100  # 初始单位数
+        self.status = "S"      # 初始状态
+        self.current_price = 0.0
+        self.historical_data = None
+        self.trading_start_time = None
+        self.trading_end_time = None
+        self.price_history = []
+        self.trade_points = []  # 记录交易点
+        self.ws = None
+        self.lock = threading.Lock()
+        
+        # 设置图表
+        self.setup_chart()
+        
+    def setup_chart(self):
+        """设置实时波形图"""
+        plt.style.use('ggplot')
+        self.fig, self.ax = plt.subplots(figsize=(12, 6))
+        self.fig.suptitle('指数实时交易波形图', fontsize=16)
+        self.ax.set_xlabel('时间')
+        self.ax.set_ylabel('指数值')
+        
+        # 初始化数据线
+        self.time_data = []
+        self.price_data = []
+        self.status_data = []
+        self.trade_x = []
+        self.trade_y = []
+        
+        # 创建图表元素
+        self.price_line, = self.ax.plot([], [], 'b-', label='指数价格')
+        self.status_markers = self.ax.scatter([], [], c=[], cmap='viridis', s=50, alpha=0.7, label='状态')
+        self.trade_markers = self.ax.scatter([], [], marker='*', c='red', s=100, label='交易点')
+        
+        # 添加图例
+        self.ax.legend(loc='upper left')
+        
+        # 设置状态颜色映射
+        self.status_colors = {'S': 0, 'T': 1, 'P': 2, 'A': 3, 'C': 4, 'E': 5}
+        
+        # 添加网格
+        self.ax.grid(True, linestyle='--', alpha=0.7)
+        
+        # 设置动画
+        self.ani = FuncAnimation(self.fig, self.update_chart, interval=1000, blit=False)
+        
+    def update_chart(self, frame):
+        """更新图表数据"""
+        with self.lock:
+            if not self.time_data:
+                return self.price_line, self.status_markers, self.trade_markers
+            
+            # 更新价格线
+            self.price_line.set_data(self.time_data, self.price_data)
+            
+            # 更新状态标记
+            status_colors = [self.status_colors.get(s, 0) for s in self.status_data]
+            self.status_markers.set_offsets(np.column_stack((mdates.date2num(self.time_data), self.price_data)))
+            self.status_markers.set_array(np.array(status_colors))
+            
+            # 更新交易点标记
+            if self.trade_x and self.trade_y:
+                self.trade_markers.set_offsets(np.column_stack((mdates.date2num(self.trade_x), self.trade_y)))
+            
+            # 动态调整x轴范围
+            if len(self.time_data) > 2:
+                self.ax.set_xlim(self.time_data[-min(60, len(self.time_data))], self.time_data[-1])
+                
+                # 设置x轴时间格式
+                self.ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+                plt.setp(self.ax.xaxis.get_majorticklabels(), rotation=45)
+                
+                # 动态调整y轴范围，留出10%的边距
+                recent_prices = self.price_data[-min(60, len(self.price_data)):]
+                if recent_prices:
+                    min_price = min(recent_prices)
+                    max_price = max(recent_prices)
+                    price_range = max_price - min_price
+                    if price_range < 1:  # 避免范围太小
+                        price_range = 1
+                    self.ax.set_ylim(min_price - price_range * 0.1, max_price + price_range * 0.1)
+            
+            # 添加状态标签
+            if self.status == 'T':
+                status_text = '交易中 (T)'
+                color = 'green'
+            elif self.status == 'S':
+                status_text = '开始/结束 (S)'
+                color = 'blue'
+            else:
+                status_text = f'状态: {self.status}'
+                color = 'gray'
+                
+            # 移除旧的状态文本
+            for txt in self.ax.texts:
+                txt.remove()
+                
+            # 添加新的状态文本和剩余单位信息
+            self.ax.text(0.02, 0.95, status_text, transform=self.ax.transAxes, 
+                        color=color, fontweight='bold', verticalalignment='top')
+            self.ax.text(0.02, 0.90, f'剩余单位: {self.units_left}', transform=self.ax.transAxes,
+                        color='black', verticalalignment='top')
+            
+            # 添加当前价格
+            self.ax.text(0.02, 0.85, f'当前价格: {self.current_price:.2f}', transform=self.ax.transAxes,
+                        color='black', verticalalignment='top')
+            
+            # 如果有交易时间窗口，显示剩余时间
+            if self.trading_start_time and self.trading_end_time and datetime.now() < self.trading_end_time:
+                remaining = (self.trading_end_time - datetime.now()).total_seconds() / 60
+                self.ax.text(0.02, 0.80, f'剩余交易时间: {remaining:.1f}分钟', transform=self.ax.transAxes,
+                            color='red', verticalalignment='top')
+        
+        return self.price_line, self.status_markers, self.trade_markers
+        
+    def load_historical_data(self, csv_path="hsi.csv"):
+        """加载历史数据"""
+        try:
+            self.historical_data = pd.read_csv(csv_path)
+            # 确保数据类型正确
+            self.historical_data['current'] = pd.to_numeric(self.historical_data['current'], errors='coerce')
+            self.historical_data['time'] = pd.to_datetime(self.historical_data['time'], format='%H:%M:%S', errors='coerce')
+            logger.info(f"成功加载历史数据，共 {len(self.historical_data)} 条记录")
+            
+            # 仅分析交易状态(T)的数据
+            trading_data = self.historical_data[self.historical_data['status'] == 'T']
+            if not trading_data.empty:
+                self.analyze_historical_patterns(trading_data)
+            else:
+                logger.warning("历史数据中没有交易状态(T)的记录")
+        except Exception as e:
+            logger.error(f"加载历史数据失败: {e}")
+    
+    def analyze_historical_patterns(self, trading_data):
+        """分析历史数据模式，寻找最佳交易时机"""
+        logger.info("分析历史交易模式...")
+        
+        # 计算价格变化率
+        trading_data['price_change'] = trading_data['current'].pct_change()
+        
+        # 计算移动平均线
+        trading_data['ma5'] = trading_data['current'].rolling(window=5).mean()
+        
+        # 计算波动率
+        trading_data['volatility'] = trading_data['current'].rolling(window=10).std()
+        
+        # 分析最佳卖出时机（例如：价格高于5周期移动平均且波动率较低的时候）
+        self.best_selling_conditions = {
+            'price_above_ma': True,  # 价格高于移动平均
+            'low_volatility': 0.002,  # 波动率阈值
+            'positive_momentum': 0.001  # 正向动量阈值
+        }
+        
+        logger.info("历史模式分析完成，已设置交易条件")
+    
+    def connect_to_websocket(self):
+        """连接到WebSocket API"""
+        ws_url = "V1/hsidist/stream/websocket"
+        
+        def on_message(ws, message):
+            try:
+                data = json.loads(message)
+                with self.lock:
+                    self.current_price = float(data.get("current", 0))
+                    new_status = data.get("status")
+                    current_time = datetime.now()
+                    
+                    # 状态变化处理
+                    if new_status != self.status:
+                        if new_status == "T" and self.status == "S":
+                            self.trading_start_time = current_time
+                            self.trading_end_time = self.trading_start_time + timedelta(minutes=10)
+                            logger.info(f"交易开始! 当前价格: {self.current_price}")
+                            # 启动交易策略
+                            threading.Thread(target=self.execute_trading_strategy).start()
+                        elif new_status == "S" and self.status == "T":
+                            logger.info("交易时间结束")
+                    
+                    self.status = new_status
+                    self.price_history.append((current_time, self.current_price, self.status))
+                    
+                    # 更新图表数据
+                    self.time_data.append(current_time)
+                    self.price_data.append(self.current_price)
+                    self.status_data.append(self.status)
+                    
+                    logger.info(f"收到市场数据: 价格={self.current_price}, 状态={self.status}")
+            except Exception as e:
+                logger.error(f"处理WebSocket消息时出错: {e}")
+        
+        def on_error(ws, error):
+            logger.error(f"WebSocket错误: {error}")
+        
+        def on_close(ws, close_status_code, close_msg):
+            logger.info("WebSocket连接关闭")
+        
+        def on_open(ws):
+            logger.info("WebSocket连接已建立")
+        
+        self.ws = websocket.WebSocketApp(ws_url,
+                                         on_message=on_message,
+                                         on_error=on_error,
+                                         on_close=on_close,
+                                         on_open=on_open)
+        
+        # 在单独的线程中运行WebSocket
+        wst = threading.Thread(target=self.ws.run_forever)
+        wst.daemon = True
+        wst.start()
+        logger.info("WebSocket客户端已启动")
+    
+    def should_sell(self, units):
+        """根据当前市场状况决定是否应该卖出"""
+        if len(self.price_history) < 10:
+            return False
+        
+        # 提取最近的价格数据
+        recent_prices = [price for _, price, status in self.price_history[-10:] if status == "T"]
+        if not recent_prices:
+            return False
+        
+        # 计算简单的技术指标
+        current = self.current_price
+        ma5 = sum(recent_prices[-5:]) / min(5, len(recent_prices[-5:]))
+        
+        # 计算价格变化率
+        if len(recent_prices) >= 2:
+            price_change = (recent_prices[-1] - recent_prices[-2]) / recent_prices[-2]
+        else:
+            price_change = 0
+        
+        # 计算波动率 (简化版)
+        if len(recent_prices) >= 5:
+            volatility = pd.Series(recent_prices[-5:]).std() / pd.Series(recent_prices[-5:]).mean()
+        else:
+            volatility = 0
+        
+        # 决策逻辑
+        # 1. 价格高于移动平均线
+        condition1 = current > ma5 if self.best_selling_conditions['price_above_ma'] else True
+        
+        # 2. 波动率低于阈值
+        condition2 = volatility < self.best_selling_conditions['low_volatility']
+        
+        # 3. 价格有正向动量
+        condition3 = price_change > self.best_selling_conditions['positive_momentum']
+        
+        # 4. 时间因素：随着交易窗口接近结束，降低卖出标准
+        time_remaining = (self.trading_end_time - datetime.now()).total_seconds() / 60 if self.trading_end_time else 10
+        time_pressure = max(0, 1 - (time_remaining / 10))  # 0到1之间的值，表示时间压力
+        
+        # 根据剩余时间调整卖出单位数
+        if time_pressure > 0.8 and self.units_left > 20:
+            # 时间快结束了，需要加速卖出
+            logger.info(f"时间压力大 ({time_pressure:.2f})，考虑加速卖出")
+            return True
+        
+        # 综合决策
+        should_sell_decision = condition1 and condition2 and condition3
+        
+        logger.info(f"交易决策分析: 价格={current}, MA5={ma5:.2f}, 波动率={volatility:.4f}, "
+                   f"价格变化率={price_change:.4f}, 时间压力={time_pressure:.2f}, 决策={should_sell_decision}")
+        
+        return should_sell_decision
+    
+    def sell_units(self, units_to_sell):
+        """调用API卖出指定单位数"""
+        if units_to_sell <= 0 or self.units_left <= 0:
+            return False
+        
+        units_to_sell = min(units_to_sell, self.units_left)
+        
+        try:
+            api_url = "V1/xxx"
+            payload = {"unit": units_to_sell}
+            response = requests.post(api_url, json=payload)
+            
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('status') == 'success':
+                    self.units_left -= units_to_sell
+                    current_time = datetime.now()
+                    
+                    # 记录交易点
+                    with self.lock:
+                        self.trade_points.append((current_time, self.current_price, units_to_sell))
+                        self.trade_x.append(current_time)
+                        self.trade_y.append(self.current_price)
+                    
+                    logger.info(f"成功卖出 {units_to_sell} 单位，剩余 {self.units_left} 单位，价格: {self.current_price}")
+                    return True
+                else:
+                    logger.error(f"卖出API返回错误: {result}")
+            else:
+                logger.error(f"卖出API请求失败，状态码: {response.status_code}")
+        except Exception as e:
+            logger.error(f"调用卖出API时出错: {e}")
+        
+        return False
+    
+    def execute_trading_strategy(self):
+        """执行交易策略"""
+        logger.info("开始执行交易策略")
+        
+        # 初始分配计划：将100单位分成几部分
+        # 策略：前期少量试探性卖出，中期根据市场情况灵活卖出，后期确保全部卖出
+        initial_plan = [
+            (0.2, 10),    # 交易时间的前20%，卖出10单位
+            (0.5, 30),    # 交易时间的中间30%，卖出30单位
+            (0.8, 40),    # 交易时间的后30%，卖出40单位
+            (1.0, 20)     # 交易时间的最后20%，卖出剩余单位
+        ]
+        
+        last_check_time = datetime.now()
+        check_interval = 5  # 每5秒检查一次市场状况
+        
+        while self.status == "T" and self.units_left > 0:
+            current_time = datetime.now()
+            
+            # 检查是否到了交易结束时间
+            if self.trading_end_time and current_time >= self.trading_end_time:
+                # 交易时间结束，卖出所有剩余单位
+                if self.units_left > 0:
+                    logger.info(f"交易时间即将结束，卖出所有剩余 {self.units_left} 单位")
+                    self.sell_units(self.units_left)
+                break
+            
+            # 每隔一段时间检查一次
+            if (current_time - last_check_time).total_seconds() >= check_interval:
+                last_check_time = current_time
+                
+                # 计算交易进度（0到1之间）
+                if self.trading_start_time and self.trading_end_time:
+                    progress = min(1.0, (current_time - self.trading_start_time).total_seconds() / 
+                                  (self.trading_end_time - self.trading_start_time).total_seconds())
+                else:
+                    progress = 0.5  # 如果没有明确的开始/结束时间，假设在中间
+                
+                # 根据交易进度和初始计划决定卖出单位数
+                target_units_sold = 0
+                for threshold, units in initial_plan:
+                    if progress <= threshold:
+                        target_units_sold += units
+                        break
+                    target_units_sold += units
+                
+                target_units_sold = min(100, target_units_sold)
+                units_should_have_sold = 100 - target_units_sold
+                
+                # 如果我们落后于计划，考虑卖出更多
+                if self.units_left > units_should_have_sold:
+                    units_behind = self.units_left - units_should_have_sold
+                    logger.info(f"当前进度: {progress:.2f}, 应该已卖出: {100-units_should_have_sold}, 实际已卖出: {100-self.units_left}, 落后: {units_behind}")
+                    
+                    # 决定卖出多少单位
+                    if self.should_sell(units_behind):
+                        # 根据市场状况决定卖出单位数
+                        if progress < 0.3:
+                            # 交易初期，谨慎卖出
+                            units_to_sell = min(5, units_behind)
+                        elif progress < 0.7:
+                            # 交易中期，适度卖出
+                            units_to_sell = min(10, units_behind)
+                        else:
+                            # 交易后期，积极卖出
+                            units_to_sell = min(20, units_behind, self.units_left)
+                        
+                        self.sell_units(units_to_sell)
+                
+                # 即使不落后于计划，也可能是好的卖出时机
+                elif self.should_sell(5) and self.units_left > 0:
+                    units_to_sell = min(5, self.units_left)
+                    logger.info(f"检测到良好的卖出时机，卖出 {units_to_sell} 单位")
+                    self.sell_units(units_to_sell)
+            
+            # 短暂休眠以避免过度CPU使用
+            time.sleep(1)
+        
+        logger.info(f"交易策略执行完毕，剩余单位: {self.units_left}")
+    
+    def run(self):
+        """运行交易程序"""
+        logger.info("启动交易程序...")
+        self.load_historical_data()
+        self.connect_to_websocket()
+        
+        # 显示图表
+        plt.ion()  # 开启交互模式
+        plt.show()
+        
+        try:
+            # 保持主线程运行
+            while True:
+                plt.pause(0.1)  # 允许图表更新
+                time.sleep(0.9)  # 减少CPU使用
+        except KeyboardInterrupt:
+            logger.info("程序被用户中断")
+        finally:
+            if self.ws:
+                self.ws.close()
+            logger.info(f"程序结束，最终剩余单位: {self.units_left}")
+            plt.ioff()
+            plt.close()
+
+if __name__ == "__main__":
+    trader = IndexTrader()
+    trader.run()
