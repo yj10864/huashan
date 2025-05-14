@@ -1,0 +1,371 @@
+def analyze_historical_patterns(self, trading_data):
+    """分析历史数据模式，寻找最佳交易时机"""
+    logger.info("分析历史交易模式...")
+    
+    # 创建一个副本进行分析，不修改原始数据
+    # analysis_data = trading_data.copy()
+    
+    # 数据量统计
+    data_points = len(trading_data)
+    days_count = len(trading_data['time'].dt.date.unique()) if 'time' in trading_data.columns else 11
+    logger.info(f"历史数据统计: 总数据点: {data_points}, 天数: {days_count}, 平均每天: {data_points/days_count:.1f}条")
+    
+    # 计算价格变化率
+    trading_data['price_change'] = trading_data['current'].pct_change()
+    
+    # 计算移动平均线 - 使用点数而非天数
+    trading_data['ma20'] = trading_data['current'].rolling(window=20).mean()  # 短期(约20个数据点)
+    trading_data['ma50'] = trading_data['current'].rolling(window=50).mean()  # 中期(约50个数据点)
+    trading_data['ma100'] = trading_data['current'].rolling(window=100).mean() # 长期(约100个数据点)
+    
+    # 计算波动率 - 使用点数
+    trading_data['volatility'] = trading_data['current'].rolling(window=30).std()
+    
+    # 计算相对强弱指标(RSI) - 使用点数
+    delta = trading_data['current'].diff()
+    gain = (delta.where(delta > 0, 0)).fillna(0)
+    loss = (-delta.where(delta < 0, 0)).fillna(0)
+    avg_gain = gain.rolling(window=14).mean()
+    avg_loss = loss.rolling(window=14).mean()
+    rs = avg_gain / avg_loss
+    trading_data['rsi'] = 100 - (100 / (1 + rs))
+    
+    # 动态调整MACD参数
+    data_length = len(trading_data)
+    logger.info(f"可用历史数据点数量: {data_length}")
+    
+    if data_length >= 200:
+        # 使用标准参数
+        fast_period = 12
+        slow_period = 26
+        signal_period = 9
+    elif data_length >= 100:
+        # 使用中等参数
+        fast_period = 8
+        slow_period = 17
+        signal_period = 6
+    else:
+        # 使用短期参数
+        fast_period = 5
+        slow_period = 10
+        signal_period = 3
+    
+    # 计算调整后的MACD
+    trading_data['ema_fast'] = trading_data['current'].ewm(span=fast_period).mean()
+    trading_data['ema_slow'] = trading_data['current'].ewm(span=slow_period).mean()
+    trading_data['macd'] = trading_data['ema_fast'] - trading_data['ema_slow']
+    trading_data['signal'] = trading_data['macd'].ewm(span=signal_period).mean()
+    
+    logger.info(f"使用调整后的MACD参数: 快线={fast_period}, 慢线={slow_period}, 信号线={signal_period}")
+    
+    # 分析最佳卖出条件
+    # 1. 找出历史数据中价格上涨的区间
+    trading_data['price_up'] = trading_data['current'].pct_change() > 0
+    
+    # 2. 分析这些上涨区间的特征
+    up_periods = trading_data[trading_data['price_up']]
+    
+    # 3. 提取成功卖出时机的特征
+    if not up_periods.empty:
+        # 计算上涨区间的平均RSI
+        avg_rsi_in_up_periods = up_periods['rsi'].mean()
+        
+        # 计算上涨区间的平均波动率
+        avg_volatility_in_up_periods = up_periods['volatility'].mean()
+        
+        # 计算上涨区间的平均价格与MA20的关系
+        avg_price_to_ma20_ratio = (up_periods['current'] / up_periods['ma20']).mean()
+        
+        # 设置最佳卖出条件 - 放宽条件阈值
+        self.best_selling_conditions = {
+            'price_above_ma': True,  # 价格高于移动平均
+            'price_to_ma20_ratio': avg_price_to_ma20_ratio,  # 价格与MA20的最佳比例
+            'optimal_rsi': avg_rsi_in_up_periods,  # 最佳RSI值
+            'low_volatility': avg_volatility_in_up_periods * 1.2,  # 放宽波动率阈值20%
+            'positive_momentum': 0.0005,  # 降低正向动量阈值
+            'rsi_threshold': 65,  # 降低RSI超买区域阈值
+            'macd_signal_cross': True  # MACD信号线交叉
+        }
+        
+        logger.info(f"从历史数据中提取的最佳卖出条件: {self.best_selling_conditions}")
+    else:
+        # 如果没有足够的上涨区间数据，使用更宽松的默认值
+        self.best_selling_conditions = {
+            'price_above_ma': True,
+            'price_to_ma20_ratio': 1.005,  # 降低要求
+            'optimal_rsi': 60,  # 降低要求
+            'low_volatility': 0.003,  # 提高容忍度
+            'positive_momentum': 0.0005,  # 降低要求
+            'rsi_threshold': 65,  # 降低要求
+            'macd_signal_cross': True
+        }
+    
+    # 保存历史数据的统计特征，用于后续决策
+    self.historical_stats = {
+        'avg_price': trading_data['current'].mean(),
+        'std_price': trading_data['current'].std(),
+        'max_price': trading_data['current'].max(),
+        'min_price': trading_data['current'].min(),
+        'avg_volatility': trading_data['volatility'].mean(),
+        'price_range': trading_data['current'].max() - trading_data['current'].min(),
+        'data_points': data_points,
+        'days_count': days_count
+    }
+    
+    logger.info("历史模式分析完成，已设置交易条件")
+    logger.info(f"历史数据统计特征: {self.historical_stats}")
+
+def execute_trading_strategy(self):
+    """执行交易策略"""
+    logger.info("开始执行交易策略")
+    
+    # 初始分配计划：将100单位分成几部分 - 更均匀分配
+    # 策略：前期更积极卖出，中期根据市场情况灵活卖出，后期确保全部卖出
+    initial_plan = [
+        (0.3, 30),    # 交易时间的前30%，卖出30单位
+        (0.6, 40),    # 交易时间的中间30%，卖出40单位
+        (0.9, 20),    # 交易时间的后30%，卖出20单位
+        (1.0, 10)     # 交易时间的最后10%，卖出剩余单位
+    ]
+    
+    last_check_time = datetime.now()
+    check_interval = 2  # 每2秒检查一次市场状况（提高检查频率）
+    
+    # 记录初始价格，用于计算价格趋势
+    initial_price = self.current_price
+    
+    # 记录每个阶段的卖出情况
+    stage_units_sold = {0: 0, 1: 0, 2: 0, 3: 0}
+    current_stage = 0
+    
+    while self.status == "T" and self.units_left > 0:
+        current_time = datetime.now()
+        
+        # 检查是否到了交易结束时间
+        if self.trading_end_time and current_time >= self.trading_end_time:
+            # 交易时间结束，卖出所有剩余单位
+            if self.units_left > 0:
+                logger.info(f"交易时间即将结束，卖出所有剩余 {self.units_left} 单位")
+                self.sell_units(self.units_left)
+            break
+        
+        # 每隔一段时间检查一次
+        if (current_time - last_check_time).total_seconds() >= check_interval:
+            last_check_time = current_time
+            
+            # 计算交易进度（0到1之间）
+            if self.trading_start_time and self.trading_end_time:
+                progress = min(1.0, (current_time - self.trading_start_time).total_seconds() / 
+                              (self.trading_end_time - self.trading_start_time).total_seconds())
+            else:
+                progress = 0.5  # 如果没有明确的开始/结束时间，假设在中间
+            
+            # 确定当前阶段
+            for i, (threshold, _) in enumerate(initial_plan):
+                if progress <= threshold:
+                    current_stage = i
+                    break
+            
+            # 计算价格趋势（与初始价格相比）
+            price_trend = (self.current_price - initial_price) / initial_price if initial_price > 0 else 0
+            
+            # 根据交易进度和初始计划决定卖出单位数
+            target_units_sold = 0
+            for i, (threshold, units) in enumerate(initial_plan):
+                if i < current_stage:
+                    target_units_sold += units
+                elif i == current_stage:
+                    # 在当前阶段内，按比例计算应该卖出的单位数
+                    if i > 0:
+                        prev_threshold = initial_plan[i-1][0]
+                        stage_progress = (progress - prev_threshold) / (threshold - prev_threshold)
+                        target_units_sold += int(units * stage_progress)
+                    else:
+                        stage_progress = progress / threshold
+                        target_units_sold += int(units * stage_progress)
+            
+            target_units_sold = min(100, target_units_sold)
+            units_should_have_sold = 100 - self.units_left
+            
+            # 如果我们落后于计划，考虑卖出更多
+            if units_should_have_sold < target_units_sold:
+                units_behind = target_units_sold - units_should_have_sold
+                logger.info(f"当前进度: {progress:.2f}, 阶段: {current_stage+1}/{len(initial_plan)}, "
+                           f"应该已卖出: {target_units_sold}, 实际已卖出: {units_should_have_sold}, 落后: {units_behind}")
+                
+                # 决定卖出多少单位
+                decision, units_to_sell = self.should_sell(units_behind)
+                if decision == 'sell' and units_to_sell > 0:
+                    success = self.sell_units(units_to_sell)
+                    if success:
+                        stage_units_sold[current_stage] += units_to_sell
+            
+            # 即使不落后于计划，也可能是好的卖出时机
+            elif progress < 0.5 and price_trend > 0.001:  # 前半段时间且价格有上涨趋势
+                decision, units_to_sell = self.should_sell(10)  # 增加前期主动卖出量
+                if decision == 'sell' and units_to_sell > 0:
+                    logger.info(f"检测到前期良好的卖出时机，价格趋势: {price_trend:.4f}, 卖出 {units_to_sell} 单位")
+                    success = self.sell_units(units_to_sell)
+                    if success:
+                        stage_units_sold[current_stage] += units_to_sell
+            
+            # 记录每个阶段的卖出情况
+            if current_stage > 0 and stage_units_sold[current_stage-1] == 0:
+                logger.warning(f"警告: 阶段{current_stage}已开始，但上一阶段没有卖出任何单位")
+        
+        # 短暂休眠以避免过度CPU使用
+        time.sleep(0.5)  # 减少休眠时间，提高响应速度
+    
+    # 记录每个阶段的卖出情况
+    logger.info("交易策略执行完毕，各阶段卖出情况:")
+    for i, (threshold, units) in enumerate(initial_plan):
+        prev_threshold = initial_plan[i-1][0] if i > 0 else 0
+        logger.info(f"阶段{i+1} (进度 {prev_threshold:.1f}-{threshold:.1f}): 计划卖出 {units} 单位, 实际卖出 {stage_units_sold[i]} 单位")
+    
+    logger.info(f"交易策略执行完毕，剩余单位: {self.units_left}")
+
+def should_sell(self, units):
+    """根据当前市场状况决定是否应该卖出以及卖出多少单位
+    
+    返回:
+        tuple: (决策, 单位数) - 决策为 'sell' 或 'hold'，单位数为 0-100
+    """
+    # 如果剩余单位为0，直接返回hold
+    if self.units_left <= 0:
+        return 'hold', 0
+    
+    # 计算剩余时间（秒）
+    if self.trading_end_time:
+        remaining_time = (self.trading_end_time - datetime.now()).total_seconds()
+    else:
+        remaining_time = 600  # 默认10分钟
+    
+    # 如果剩余时间小于20秒且还有剩余单位，全部卖出
+    if remaining_time < 20 and self.units_left > 0:
+        return 'sell', self.units_left
+    
+    # 确保有足够的价格历史数据
+    min_history_points = 10  # 需要至少10个数据点
+    if len(self.price_history) < min_history_points:
+        return 'hold', 0
+    
+    # 提取最近的价格数据
+    recent_prices = [price for _, price, status in self.price_history[-30:] if status == "T"]
+    if len(recent_prices) < min_history_points:
+        return 'hold', 0
+    
+    # 计算当前技术指标
+    current = self.current_price
+    ma20 = sum(recent_prices[-20:]) / min(20, len(recent_prices[-20:]))
+    
+    # 计算价格变化率 (短期)
+    if len(recent_prices) >= 2:
+        price_change_short = (recent_prices[-1] - recent_prices[-2]) / recent_prices[-2]
+    else:
+        price_change_short = 0
+    
+    # 计算价格变化率 (中期)
+    if len(recent_prices) >= 10:
+        price_change_medium = (recent_prices[-1] - recent_prices[-10]) / recent_prices[-10]
+    else:
+        price_change_medium = price_change_short
+    
+    # 计算波动率
+    if len(recent_prices) >= 20:
+        volatility = pd.Series(recent_prices[-20:]).std() / pd.Series(recent_prices[-20:]).mean()
+    else:
+        volatility = 0
+    
+    # 计算简化版RSI
+    if len(recent_prices) >= 14:
+        delta = pd.Series(recent_prices[-14:]).diff().dropna()
+        gain = delta.where(delta > 0, 0).sum()
+        loss = -delta.where(delta < 0, 0).sum()
+        if loss == 0:
+            rsi = 100
+        else:
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+    else:
+        rsi = 50  # 默认值
+    
+    # 使用历史数据分析结果进行决策
+    # 1. 价格高于移动平均线
+    condition1 = current > ma20 if self.best_selling_conditions['price_above_ma'] else True
+    
+    # 2. 价格与MA20的比例接近历史最佳比例
+    price_to_ma20_ratio = current / ma20 if ma20 > 0 else 1
+    ratio_diff = abs(price_to_ma20_ratio - self.best_selling_conditions.get('price_to_ma20_ratio', 1.005))
+    condition2 = ratio_diff < 0.02  # 允许2%的误差
+    
+    # 3. 波动率接近历史最佳波动率
+    volatility_match = abs(volatility - self.best_selling_conditions.get('low_volatility', 0.002))
+    condition3 = volatility_match < 0.001  # 允许0.1%的误差
+    
+    # 4. RSI接近历史最佳值或超过阈值（超买区域）
+    rsi_optimal_diff = abs(rsi - self.best_selling_conditions.get('optimal_rsi', 60))
+    rsi_threshold = self.best_selling_conditions.get('rsi_threshold', 65)
+    condition4 = rsi_optimal_diff < 8 or rsi > rsi_threshold  # 放宽差异范围
+    
+    # 5. 价格接近历史高点
+    if hasattr(self, 'historical_stats'):
+        historical_max = self.historical_stats.get('max_price', current)
+        price_to_max_ratio = current / historical_max if historical_max > 0 else 0
+        condition5 = price_to_max_ratio > 0.92  # 放宽到92%
+    else:
+        condition5 = True
+    
+    # 6. 价格有正向动量
+    condition6 = price_change_short > self.best_selling_conditions.get('positive_momentum', 0.0005)
+    
+    # 7. 中期价格趋势向上
+    condition7 = price_change_medium > 0
+    
+    # 8. 时间因素：随着交易窗口接近结束，降低卖出标准
+    time_pressure = max(0, 1 - (remaining_time / 600))  # 0到1之间的值，表示时间压力
+    
+    # 根据剩余时间调整卖出标准 - 更均匀地分配交易
+    if time_pressure > 0.8:
+        # 时间快结束了，需要加速卖出，降低标准
+        logger.info(f"时间压力大 ({time_pressure:.2f})，降低卖出标准")
+        required_conditions = 2  # 只需满足2个条件
+    elif time_pressure > 0.6:
+        required_conditions = 2  # 需满足2个条件
+    elif time_pressure > 0.3:
+        required_conditions = 3  # 需满足3个条件
+    else:
+        required_conditions = 3  # 前期也只需满足3个条件，增加交易机会
+    
+    # 计算满足的条件数
+    conditions = [condition1, condition2, condition3, condition4, condition5, condition6, condition7]
+    conditions_met = sum(conditions)
+    
+    # 综合决策
+    should_sell_decision = conditions_met >= required_conditions
+    
+    # 记录详细的决策过程
+    logger.info(f"交易决策分析: 价格={current}, MA20={ma20:.2f}, 波动率={volatility:.4f}, RSI={rsi:.1f}, "
+               f"价格/MA20比例={price_to_ma20_ratio:.3f}(目标:{self.best_selling_conditions.get('price_to_ma20_ratio', 1.005):.3f}), "
+               f"短期变化率={price_change_short:.4f}, 中期变化率={price_change_medium:.4f}, 时间压力={time_pressure:.2f}")
+    
+    condition_names = ["价格>MA20", "价格/MA20比例", "波动率", "RSI", "接近历史高点", "短期正向动量", "中期上升趋势"]
+    condition_status = [conditions[i] for i in range(len(conditions))]
+    condition_log = ", ".join([f"{condition_names[i]}:{condition_status[i]}" for i in range(len(conditions))])
+    logger.info(f"条件满足情况: {condition_log}")
+    logger.info(f"满足{conditions_met}/{required_conditions}个条件，决策={should_sell_decision}")
+    
+    if should_sell_decision:
+        # 决定卖出单位数 - 更均匀地分配交易量
+        if time_pressure < 0.3:
+            # 交易初期，适度卖出
+            units_to_sell = min(15, self.units_left)  # 增加初期卖出量
+        elif time_pressure < 0.6:
+            # 交易中期，适度卖出
+            units_to_sell = min(15, self.units_left)
+        else:
+            # 交易后期，积极卖出
+            units_to_sell = min(20, self.units_left)
+        
+        return 'sell', units_to_sell
+    else:
+        return 'hold', 0
